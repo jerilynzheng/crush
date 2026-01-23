@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/version"
 	"github.com/posthog/posthog-go"
@@ -15,6 +16,8 @@ import (
 const (
 	endpoint = "https://data.charm.land"
 	key      = "phc_4zt4VgDWLqbYnJYEwLRxFoaTL2noNrQij0C6E8k3I0V"
+
+	nonInteractiveEventName = "NonInteractive"
 )
 
 var (
@@ -27,11 +30,11 @@ var (
 			Set("SHELL", filepath.Base(os.Getenv("SHELL"))).
 			Set("Version", version.Version).
 			Set("GoVersion", runtime.Version()).
-			Set("Interactive", false)
+			Set(nonInteractiveEventName, false)
 )
 
-func SetInteractive(interactive bool) {
-	baseProps = baseProps.Set("interactive", interactive)
+func SetNonInteractive(nonInteractive bool) {
+	baseProps = baseProps.Set(nonInteractiveEventName, nonInteractive)
 }
 
 func Init() {
@@ -83,19 +86,16 @@ func Error(err any, props ...any) {
 	if client == nil {
 		return
 	}
-	// The PostHog Go client does not yet support sending exceptions.
-	// We're mimicking the behavior by sending the minimal info required
-	// for PostHog to recognize this as an exception event.
-	props = append(
-		[]any{
-			"$exception_list",
-			[]map[string]string{
-				{"type": reflect.TypeOf(err).String(), "value": fmt.Sprintf("%v", err)},
-			},
-		},
-		props...,
-	)
-	send("$exception", props...)
+	posthogErr := client.Enqueue(posthog.NewDefaultException(
+		time.Now(),
+		distinctId,
+		reflect.TypeOf(err).String(),
+		fmt.Sprintf("%v", err),
+	))
+	if err != nil {
+		slog.Error("Failed to enqueue PostHog error", "err", err, "props", props, "posthogErr", posthogErr)
+		return
+	}
 }
 
 func Flush() {

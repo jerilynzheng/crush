@@ -117,6 +117,11 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 		return nil, err
 	}
 
+	// refresh models before each run
+	if err := c.UpdateModels(ctx); err != nil {
+		return nil, fmt.Errorf("failed to update models: %w", err)
+	}
+
 	model := c.currentAgent.Model()
 	maxTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
@@ -317,12 +322,7 @@ func mergeCallOptions(model Model, cfg config.ProviderConfig) (fantasy.ProviderO
 }
 
 func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, agent config.Agent, isSubAgent bool) (SessionAgent, error) {
-	large, small, err := c.buildAgentModels(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	systemPrompt, err := prompt.Build(ctx, large.Model.Provider(), large.Model.Model(), *c.cfg)
+	large, small, err := c.buildAgentModels(ctx, isSubAgent)
 	if err != nil {
 		return nil, err
 	}
@@ -332,7 +332,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		large,
 		small,
 		largeProviderCfg.SystemPromptPrefix,
-		systemPrompt,
+		"",
 		isSubAgent,
 		c.cfg.Options.DisableAutoSummarize,
 		c.permissions.SkipRequests(),
@@ -340,6 +340,16 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		c.messages,
 		nil,
 	})
+
+	c.readyWg.Go(func() error {
+		systemPrompt, err := prompt.Build(ctx, large.Model.Provider(), large.Model.Model(), *c.cfg)
+		if err != nil {
+			return err
+		}
+		result.SetSystemPrompt(systemPrompt)
+		return nil
+	})
+
 	c.readyWg.Go(func() error {
 		tools, err := c.buildTools(ctx, agent)
 		if err != nil {
@@ -396,7 +406,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent) ([]fan
 	)
 
 	if len(c.cfg.LSP) > 0 {
-		allTools = append(allTools, tools.NewDiagnosticsTool(c.lspClients), tools.NewReferencesTool(c.lspClients))
+		allTools = append(allTools, tools.NewDiagnosticsTool(c.lspClients), tools.NewReferencesTool(c.lspClients), tools.NewLSPRestartTool(c.lspClients))
 	}
 
 	var filteredTools []fantasy.AgentTool
@@ -407,12 +417,6 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent) ([]fan
 	}
 
 	for _, tool := range tools.GetMCPTools(c.permissions, c.cfg.WorkingDir()) {
-		// Check MCP-specific disabled tools.
-		if mcpCfg, ok := c.cfg.MCP[tool.MCP()]; ok {
-			if slices.Contains(mcpCfg.DisabledTools, tool.MCPToolName()) {
-				continue
-			}
-		}
 		if agent.AllowedMCP == nil {
 			// No MCP restrictions
 			filteredTools = append(filteredTools, tool)
@@ -441,7 +445,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent) ([]fan
 }
 
 // TODO: when we support multiple agents we need to change this so that we pass in the agent specific model config
-func (c *coordinator) buildAgentModels(ctx context.Context) (Model, Model, error) {
+func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Model, Model, error) {
 	largeModelCfg, ok := c.cfg.Models[config.SelectedModelTypeLarge]
 	if !ok {
 		return Model{}, Model{}, errors.New("large model not selected")
@@ -456,7 +460,7 @@ func (c *coordinator) buildAgentModels(ctx context.Context) (Model, Model, error
 		return Model{}, Model{}, errors.New("large model provider not configured")
 	}
 
-	largeProvider, err := c.buildProvider(largeProviderCfg, largeModelCfg)
+	largeProvider, err := c.buildProvider(largeProviderCfg, largeModelCfg, isSubAgent)
 	if err != nil {
 		return Model{}, Model{}, err
 	}
@@ -466,7 +470,7 @@ func (c *coordinator) buildAgentModels(ctx context.Context) (Model, Model, error
 		return Model{}, Model{}, errors.New("large model provider not configured")
 	}
 
-	smallProvider, err := c.buildProvider(smallProviderCfg, largeModelCfg)
+	smallProvider, err := c.buildProvider(smallProviderCfg, largeModelCfg, true)
 	if err != nil {
 		return Model{}, Model{}, err
 	}
@@ -490,7 +494,7 @@ func (c *coordinator) buildAgentModels(ctx context.Context) (Model, Model, error
 	}
 
 	if smallCatwalkModel == nil {
-		return Model{}, Model{}, errors.New("snall model not found in provider config")
+		return Model{}, Model{}, errors.New("small model not found in provider config")
 	}
 
 	largeModelID := largeModelCfg.Model
@@ -524,13 +528,13 @@ func (c *coordinator) buildAgentModels(ctx context.Context) (Model, Model, error
 		}, nil
 }
 
-func (c *coordinator) buildAnthropicProvider(baseURL, apiKey string, headers map[string]string, isOauth bool) (fantasy.Provider, error) {
+func (c *coordinator) buildAnthropicProvider(baseURL, apiKey string, headers map[string]string) (fantasy.Provider, error) {
 	var opts []anthropic.Option
 
-	if isOauth {
+	if strings.HasPrefix(apiKey, "Bearer ") {
 		// NOTE: Prevent the SDK from picking up the API key from env.
 		os.Setenv("ANTHROPIC_API_KEY", "")
-		headers["Authorization"] = fmt.Sprintf("Bearer %s", apiKey)
+		headers["Authorization"] = apiKey
 	} else if apiKey != "" {
 		// X-Api-Key header
 		opts = append(opts, anthropic.WithAPIKey(apiKey))
@@ -583,7 +587,7 @@ func (c *coordinator) buildOpenrouterProvider(_, apiKey string, headers map[stri
 	return openrouter.New(opts...)
 }
 
-func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers map[string]string, extraBody map[string]any, providerID string) (fantasy.Provider, error) {
+func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers map[string]string, extraBody map[string]any, providerID string, isSubAgent bool) (fantasy.Provider, error) {
 	opts := []openaicompat.Option{
 		openaicompat.WithBaseURL(baseURL),
 		openaicompat.WithAPIKey(apiKey),
@@ -592,7 +596,8 @@ func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers 
 	// Set HTTP client based on provider and debug mode.
 	var httpClient *http.Client
 	if providerID == string(catwalk.InferenceProviderCopilot) {
-		httpClient = copilot.NewClient(c.cfg.Options.Debug)
+		opts = append(opts, openaicompat.WithUseResponsesAPI())
+		httpClient = copilot.NewClient(isSubAgent, c.cfg.Options.Debug)
 	} else if c.cfg.Options.Debug {
 		httpClient = log.NewHTTPClient()
 	}
@@ -714,7 +719,7 @@ func (c *coordinator) isAnthropicThinking(model config.SelectedModel) bool {
 	return false
 }
 
-func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model config.SelectedModel) (fantasy.Provider, error) {
+func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model config.SelectedModel, isSubAgent bool) (fantasy.Provider, error) {
 	headers := maps.Clone(providerCfg.ExtraHeaders)
 	if headers == nil {
 		headers = make(map[string]string)
@@ -736,7 +741,7 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 	case openai.Name:
 		return c.buildOpenaiProvider(baseURL, apiKey, headers)
 	case anthropic.Name:
-		return c.buildAnthropicProvider(baseURL, apiKey, headers, providerCfg.OAuthToken != nil)
+		return c.buildAnthropicProvider(baseURL, apiKey, headers)
 	case openrouter.Name:
 		return c.buildOpenrouterProvider(baseURL, apiKey, headers)
 	case azure.Name:
@@ -754,7 +759,7 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 			}
 			providerCfg.ExtraBody["tool_stream"] = true
 		}
-		return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody, providerCfg.ID)
+		return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody, providerCfg.ID, isSubAgent)
 	case hyper.Name:
 		return c.buildHyperProvider(baseURL, apiKey)
 	default:
@@ -799,7 +804,7 @@ func (c *coordinator) Model() Model {
 
 func (c *coordinator) UpdateModels(ctx context.Context) error {
 	// build the models again so we make sure we get the latest config
-	large, small, err := c.buildAgentModels(ctx)
+	large, small, err := c.buildAgentModels(ctx, false)
 	if err != nil {
 		return err
 	}

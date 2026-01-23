@@ -15,6 +15,7 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/filepathext"
+	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/permission"
 )
@@ -32,13 +33,6 @@ type ViewPermissionsParams struct {
 	FilePath string `json:"file_path"`
 	Offset   int    `json:"offset"`
 	Limit    int    `json:"limit"`
-}
-
-type viewTool struct {
-	lspClients  *csync.Map[string, *lsp.Client]
-	workingDir  string
-	permissions permission.Service
-	skillsPaths []string
 }
 
 type ViewResponseMetadata struct {
@@ -87,7 +81,7 @@ func NewViewTool(lspClients *csync.Map[string, *lsp.Client], permissions permiss
 					return fantasy.ToolResponse{}, fmt.Errorf("session ID is required for accessing files outside working directory")
 				}
 
-				granted := permissions.Request(
+				granted, err := permissions.Request(ctx,
 					permission.CreatePermissionRequest{
 						SessionID:   sessionID,
 						Path:        absFilePath,
@@ -98,7 +92,9 @@ func NewViewTool(lspClients *csync.Map[string, *lsp.Client], permissions permiss
 						Params:      ViewPermissionsParams(params),
 					},
 				)
-
+				if err != nil {
+					return fantasy.ToolResponse{}, err
+				}
 				if !granted {
 					return fantasy.ToolResponse{}, permission.ErrorPermissionDenied
 				}
@@ -194,7 +190,7 @@ func NewViewTool(lspClients *csync.Map[string, *lsp.Client], permissions permiss
 			}
 			output += "\n</file>\n"
 			output += getDiagnostics(filePath, lspClients)
-			recordFileRead(filePath)
+			filetracker.RecordRead(filePath)
 			return fantasy.WithResponseMetadata(
 				fantasy.NewTextResponse(output),
 				ViewResponseMetadata{
